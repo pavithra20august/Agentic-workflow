@@ -5,28 +5,22 @@
 # it just defines the flow: which agent runs after which, and the
 # conditions for looping back (revisions) or finishing.
 #
-#   PLANNER -> (valid?) -> RESEARCHER -> WRITER -> GUARDRAILS -> REVIEWER
-#       |                                              |
-#       +-> END (invalid)                              +-- (revision) -> WRITER
-#                                                      |
-#                                                      +-- (approved) -> HUMAN_APPROVAL
-#                                                           |
-#                                                           +-- (rejected) -> WRITER
-#                                                           +-- (approved) -> EVALUATION -> END
+#   PLANNER -> RESEARCHER -> WRITER -> REVIEWER --+-- (needs revision) --> back to WRITER
+#                                                  |
+#                                                  +-- (approved) --> HUMAN_APPROVAL --+-- (rejected) --> back to WRITER
+#                                                                                        |
+#                                                                                        +-- (approved) --> END
 # =====================================================================
 
 from typing import TypedDict
 from langgraph.graph import StateGraph, END
 
-from agents import (planner_agent, researcher_agent, writer_agent, reviewer_agent,
-                    call_gemini, guardrails_engine, evaluator)
-from guardrails import GuardrailsEngine
-from evaluation import EvaluationEngine
+from agents import planner_agent, researcher_agent, writer_agent, reviewer_agent
 from memory_store import MemoryStore
 
 memory = MemoryStore()
 
-MAX_REVISIONS = 3
+MAX_REVISIONS = 3  # safety cap, same idea as our earlier max_steps loop guard
 
 
 class BlogState(TypedDict, total=False):
@@ -39,17 +33,7 @@ class BlogState(TypedDict, total=False):
     review_feedback: str
     auto_approved: bool
     revision_count: int
-    human_decision: str
-
-    # Guardrails & Safety
-    safety_flags: list
-    token_usage: dict
-    hallucination_flags: list
-
-    # Evaluation & Debugging
-    evaluation_scores: dict
-    run_metrics: dict
-    debug_mode: bool
+    human_decision: str   # "approved" or "rejected"
 
 
 # ---------------------------------------------------------------------
@@ -86,81 +70,21 @@ def human_approval_node(state: BlogState) -> dict:
 
 
 # ---------------------------------------------------------------------
-# GUARDRAILS NODE
-# Runs comprehensive safety checks on the draft before review.
-# ---------------------------------------------------------------------
-def guardrails_node(state: BlogState) -> dict:
-    engine = GuardrailsEngine(gemini_caller=call_gemini)
-    draft = state.get("draft", "")
-    research_notes = state.get("research_notes", "")
-
-    results = engine.run_all_checks(
-        content=draft,
-        agent_name="writer",
-        research_notes=research_notes,
-    )
-
-    flags = engine.all_flags
-    hallucination_flags = [f["detail"] for f in flags if f["check_type"] == "hallucination"]
-
-    if engine.blocking_flags:
-        print(f"\n[Guardrails] BLOCKED: {len(engine.blocking_flags)} blocking safety issue(s):")
-        for f in engine.blocking_flags:
-            print(f"  - {f['check_type']}: {f['detail']}")
-    elif flags:
-        print(f"\n[Guardrails] {len(flags)} warning(s) found (non-blocking).")
-    else:
-        print("\n[Guardrails] All checks passed.")
-
-    return {"safety_flags": flags, "hallucination_flags": hallucination_flags}
-
-
-# ---------------------------------------------------------------------
-# EVALUATION NODE
-# Runs quality scoring on the final draft before the pipeline ends.
-# ---------------------------------------------------------------------
-def evaluation_node(state: BlogState) -> dict:
-    debug = state.get("debug_mode", False)
-    eval_engine = EvaluationEngine(debug=debug, gemini_caller=call_gemini)
-
-    draft = state.get("draft", "")
-    plan = state.get("plan", "")
-    research_notes = state.get("research_notes", "")
-
-    scores = eval_engine.score_quality(draft, plan, research_notes)
-
-    if scores.get("overall", -1) > 0:
-        print(f"\n[Evaluation] Quality scores: clarity={scores['clarity']}, "
-              f"accuracy={scores['accuracy']}, completeness={scores['completeness']}, "
-              f"engagement={scores['engagement']}, overall={scores['overall']:.1f}/10")
-    else:
-        print("\n[Evaluation] Quality scoring could not be completed.")
-
-    return {"evaluation_scores": scores}
-
-
-# ---------------------------------------------------------------------
 # CONDITIONAL EDGES (the "decide where to go next" logic)
 # ---------------------------------------------------------------------
-def route_after_planner(state: BlogState) -> str:
-    if not state.get("plan"):
-        print("\n[Orchestrator] No plan produced (input validation failed). Stopping.")
-        return END
-    return "researcher"
-
-
 def route_after_review(state: BlogState) -> str:
     if state.get("auto_approved") or state.get("revision_count", 0) >= MAX_REVISIONS:
         return "human_approval"
-    return "writer"
+    return "writer"  # send back for another revision pass
 
 
 def route_after_human(state: BlogState) -> str:
     if state.get("human_decision") == "approved":
-        return "evaluation"
+        return END
     if state.get("revision_count", 0) >= MAX_REVISIONS:
+        # Safety cap hit even after human feedback -- stop instead of looping forever
         print("\n[Orchestrator] Max revisions reached. Stopping.")
-        return "evaluation"
+        return END
     return "writer"
 
 
@@ -173,21 +97,13 @@ def build_graph():
     graph.add_node("planner", planner_agent)
     graph.add_node("researcher", researcher_agent)
     graph.add_node("writer", writer_agent)
-    graph.add_node("guardrails", guardrails_node)
     graph.add_node("reviewer", reviewer_agent)
     graph.add_node("human_approval", human_approval_node)
-    graph.add_node("evaluation", evaluation_node)
 
     graph.set_entry_point("planner")
-
-    graph.add_conditional_edges("planner", route_after_planner, {
-        "researcher": "researcher",
-        END: END,
-    })
-
+    graph.add_edge("planner", "researcher")
     graph.add_edge("researcher", "writer")
-    graph.add_edge("writer", "guardrails")
-    graph.add_edge("guardrails", "reviewer")
+    graph.add_edge("writer", "reviewer")
 
     graph.add_conditional_edges("reviewer", route_after_review, {
         "writer": "writer",
@@ -196,9 +112,7 @@ def build_graph():
 
     graph.add_conditional_edges("human_approval", route_after_human, {
         "writer": "writer",
-        "evaluation": "evaluation",
+        END: END,
     })
-
-    graph.add_edge("evaluation", END)
 
     return graph.compile()

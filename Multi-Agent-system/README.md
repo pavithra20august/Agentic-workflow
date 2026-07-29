@@ -4,14 +4,11 @@ A multi-agent pipeline that researches, writes, and reviews AI/ML blog posts,
 with a vector-DB memory (RAG) for your preferences and a human approval gate.
 
 ```
-PLANNER -> (valid?) -> RESEARCHER -> WRITER -> GUARDRAILS -> REVIEWER
-    |                                               |
-    +-> END (invalid)                               +-- revision -> WRITER
-                                                    |
-                                                    +-- approved -> HUMAN APPROVAL
-                                                         |
-                                                         +-- rejected -> WRITER
-                                                         +-- approved -> EVALUATION -> END
+PLANNER -> RESEARCHER -> WRITER -> REVIEWER --+-- needs revision --> back to WRITER
+                                               |
+                                               +-- approved --> HUMAN APPROVAL --+-- rejected --> back to WRITER
+                                                                                  |
+                                                                                  +-- approved --> DONE
 ```
 
 ## Setup
@@ -20,8 +17,7 @@ PLANNER -> (valid?) -> RESEARCHER -> WRITER -> GUARDRAILS -> REVIEWER
 pip install -r requirements.txt
 cp .env.example .env
 # then edit .env and paste your real Gemini API key
-python main.py            # normal mode
-python main.py --debug    # verbose debug output + trace export
+python main.py
 ```
 
 ## File-by-file guide
@@ -32,10 +28,8 @@ python main.py --debug    # verbose debug output + trace export
 | `tools.py` | A mock `web_search` tool used only by the Researcher agent (swap for a real search API in production) |
 | `memory_store.py` | Vector DB (ChromaDB) storing your instructions/approvals as embeddings, using Gemini's own embedding model — this is the **RAG** piece |
 | `mcp_context.py` | A simplified, **MCP-style** structured context store agents write their outputs into, so the full handoff history is inspectable as JSON (see note below) |
-| `guardrails.py` | **Guardrails & Safety** — input validation, prompt injection detection, PII scanning, LLM-based content safety, output format checks, and hallucination flagging |
-| `evaluation.py` | **Evaluation & Debugging** — per-agent timing, structured tracing, LLM-based quality scoring (clarity/accuracy/completeness/engagement), debug mode, and summary reports |
-| `graph.py` | The **LangGraph** orchestrator — defines node order, guardrails/evaluation nodes, and the revision/approval loops |
-| `main.py` | CLI entry point that runs one full pipeline session (supports `--debug` flag) |
+| `graph.py` | The **LangGraph** orchestrator — defines node order and the revision/approval loops |
+| `main.py` | CLI entry point that runs one full pipeline session |
 
 ## How each concept from your roadmap maps into this code
 
@@ -45,10 +39,7 @@ python main.py --debug    # verbose debug output + trace export
 - **Orchestration (LangGraph)** → `graph.py`: `StateGraph` with conditional edges implementing the revision loop and a safety cap (`MAX_REVISIONS`)
 - **MCP protocol (simplified)** → `mcp_context.py`: agents publish their outputs to a shared structured context resource instead of passing raw strings peer-to-peer. **Honest caveat:** this is a simplified illustration of MCP's core idea (structured, inspectable shared context), not the real client-server MCP spec. For a production system, replace this class with an actual MCP server using the `mcp` Python SDK, exposing the same `get_context` / `update_context` operations as real MCP resources.
 - **Human-in-the-loop guardrail** → `human_approval_node()` in `graph.py`: nothing is treated as final until a human explicitly approves it
-- **Guardrails & Safety** → `guardrails.py` + `guardrails_node()` in the graph: input validation with prompt injection detection, PII scanning (emails, phones, SSNs, credit cards), LLM-based content safety classification, output format validation per agent, and hallucination detection by comparing draft claims against research notes
-- **Evaluation & Debugging** → `evaluation.py` + `evaluation_node()` in the graph: per-agent timing and tracing, LLM-based quality scoring on 4 dimensions (clarity, accuracy, completeness, engagement), a formatted summary report at the end of each run, and a `--debug` flag for verbose output with JSON trace export
-- **Token tracking** → `TokenTracker` in `guardrails.py`: tracks approximate token usage per agent call using SDK metadata or character-based estimation
-- **Error handling / safety caps** → `MAX_REVISIONS` prevents infinite revision loops; input validation stops the pipeline early on invalid/injected input; content safety blocks unsafe content
+- **Error handling / safety caps** → `MAX_REVISIONS` prevents infinite revision loops, mirroring the `max_steps` pattern from our earlier calculator agent
 
 ## A note on chosen defaults
 
