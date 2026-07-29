@@ -20,15 +20,18 @@ from google.genai import types
 from memory_store import MemoryStore
 from mcp_context import MCPContextStore
 from tools import web_search
+from guardrails import GuardrailsEngine, TokenTracker
+from evaluation import EvaluationEngine
 
 MODEL = "gemini-2.5-pro"
 
 _client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 memory = MemoryStore()
 mcp = MCPContextStore()
+token_tracker = TokenTracker()
 
 
-def _call_gemini(system_prompt: str, user_prompt: str, tools=None) -> str:
+def _call_gemini(system_prompt: str, user_prompt: str, tools=None, agent_name: str = None) -> str:
     """Small shared helper so every agent calls Gemini the same consistent way."""
     config = types.GenerateContentConfig(system_instruction=system_prompt)
     if tools:
@@ -39,7 +42,31 @@ def _call_gemini(system_prompt: str, user_prompt: str, tools=None) -> str:
         contents=user_prompt,
         config=config,
     )
+
+    if agent_name:
+        try:
+            token_tracker.record(agent_name, response)
+        except Exception:
+            token_tracker.record_fallback(
+                agent_name,
+                len(system_prompt) + len(user_prompt),
+                len(response.text) if response.text else 0,
+            )
+
     return response.text
+
+
+call_gemini = _call_gemini
+
+guardrails_engine = GuardrailsEngine(gemini_caller=_call_gemini)
+evaluator = EvaluationEngine(debug=False, gemini_caller=_call_gemini)
+
+
+def configure_engines(debug=False):
+    """Called by main.py to set debug mode on the evaluation engine."""
+    evaluator.debug = debug
+    if debug:
+        evaluator.debug_log("Debug mode enabled -- verbose output active")
 
 
 # ---------------------------------------------------------------------
@@ -52,8 +79,14 @@ def planner_agent(state: dict) -> dict:
     topic = state["topic"]
     user_instructions = state.get("user_instructions", "")
 
+    validation = guardrails_engine.validate_input(topic, user_instructions)
+    if not validation["valid"]:
+        print(f"\n[Guardrails] Input validation FAILED: {validation['issues']}")
+        return {"plan": "", "safety_flags": guardrails_engine.all_flags}
+
+    evaluator.start_agent("planner")
+
     # RAG STEP: pull relevant past user preferences from vector memory
-    # e.g. "always keep blogs under 800 words", "avoid heavy jargon"
     remembered = memory.search_relevant_memories(topic, n_results=3)
     memory_context = "\n".join(f"- {m}" for m in remembered) if remembered else "(no prior preferences on file)"
 
@@ -74,10 +107,17 @@ Remembered preferences from past sessions (apply these too):
 Produce the outline now.
 """
 
-    plan = _call_gemini(system_prompt, user_prompt)
+    plan = _call_gemini(system_prompt, user_prompt, agent_name="planner")
+
+    guardrails_engine.check_output_format(plan, "planner")
+    guardrails_engine.check_pii(plan, "planner")
 
     mcp.update_context(session_id, "plan", plan)
     mcp.update_context(session_id, "memory_used", remembered)
+
+    evaluator.end_agent("planner",
+                        input_keys=["topic", "user_instructions"],
+                        output_keys=["plan"])
 
     print("\n[Planner Agent] Plan created.")
     return {"plan": plan}
@@ -93,6 +133,8 @@ def researcher_agent(state: dict) -> dict:
     session_id = state["session_id"]
     plan = state["plan"]
 
+    evaluator.start_agent("researcher")
+
     system_prompt = """You are the RESEARCHER agent for an AI/ML blog-writing team.
 Use the web_search tool to gather accurate, current supporting facts for each
 section in the plan you're given. Summarize findings in bullet points grouped
@@ -101,9 +143,17 @@ notes the writer can use."""
 
     user_prompt = f"Here is the blog plan:\n\n{plan}\n\nResearch each section now."
 
-    notes = _call_gemini(system_prompt, user_prompt, tools=[web_search])
+    notes = _call_gemini(system_prompt, user_prompt, tools=[web_search], agent_name="researcher")
+
+    guardrails_engine.check_output_format(notes, "researcher")
+    guardrails_engine.check_pii(notes, "researcher")
 
     mcp.update_context(session_id, "research_notes", notes)
+
+    evaluator.end_agent("researcher",
+                        input_keys=["plan"],
+                        output_keys=["research_notes"])
+
     print("[Researcher Agent] Research notes gathered.")
     return {"research_notes": notes}
 
@@ -119,6 +169,8 @@ def writer_agent(state: dict) -> dict:
     research_notes = state["research_notes"]
     review_feedback = state.get("review_feedback", "")
     revision_count = state.get("revision_count", 0)
+
+    evaluator.start_agent("writer")
 
     system_prompt = """You are the WRITER agent for an AI/ML blog-writing team.
 Write an engaging, technically accurate blog post following the given plan and
@@ -137,9 +189,17 @@ Revision feedback to address (if any): {review_feedback or "(first draft, no fee
 Write the full blog post now.
 """
 
-    draft = _call_gemini(system_prompt, user_prompt)
+    draft = _call_gemini(system_prompt, user_prompt, agent_name="writer")
+
+    guardrails_engine.check_output_format(draft, "writer")
+    guardrails_engine.check_pii(draft, "writer")
 
     mcp.update_context(session_id, f"draft_v{revision_count}", draft)
+
+    evaluator.end_agent("writer",
+                        input_keys=["plan", "research_notes", "review_feedback"],
+                        output_keys=["draft", "revision_count"])
+
     print(f"[Writer Agent] Draft v{revision_count} written.")
     return {"draft": draft, "revision_count": revision_count + 1}
 
@@ -155,6 +215,8 @@ def reviewer_agent(state: dict) -> dict:
     draft = state["draft"]
     plan = state["plan"]
 
+    evaluator.start_agent("reviewer")
+
     system_prompt = """You are the REVIEWER agent for an AI/ML blog-writing team.
 Check the draft against the plan for: technical accuracy, clarity, whether it
 covers every planned section, and reasonable length. Respond in this exact format:
@@ -164,7 +226,11 @@ FEEDBACK: <specific, actionable feedback -- empty if APPROVE>"""
 
     user_prompt = f"Plan:\n{plan}\n\nDraft to review:\n{draft}"
 
-    result = _call_gemini(system_prompt, user_prompt)
+    result = _call_gemini(system_prompt, user_prompt, agent_name="reviewer")
+
+    format_check = guardrails_engine.check_output_format(result, "reviewer")
+    if not format_check["valid"]:
+        evaluator.debug_log(f"Reviewer output format issue: {format_check['issues']}")
 
     verdict_line = next((l for l in result.splitlines() if l.startswith("VERDICT:")), "VERDICT: REVISE")
     approved = "APPROVE" in verdict_line.upper()
@@ -174,6 +240,11 @@ FEEDBACK: <specific, actionable feedback -- empty if APPROVE>"""
         feedback = result.split("FEEDBACK:", 1)[1].strip()
 
     mcp.update_context(session_id, "review_result", result)
+
+    evaluator.end_agent("reviewer",
+                        input_keys=["draft", "plan"],
+                        output_keys=["review_feedback", "auto_approved"])
+
     print(f"[Reviewer Agent] Verdict: {'APPROVE' if approved else 'REVISE'}")
 
     return {"review_feedback": feedback, "auto_approved": approved}
